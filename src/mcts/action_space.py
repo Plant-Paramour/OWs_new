@@ -1,0 +1,248 @@
+"""MCTS 动作空间与枚举。
+
+支持渐进式候选池展开和剪枝规则。
+同一枚举函数对任意玩家通用——我方和敌方动作空间共用。
+"""
+
+import math
+from dataclasses import dataclass, field
+
+from ..engine.interception import aim_at, check_path_blocked
+from ..engine.physics import dist
+from ..engine.validation import validate_fleet_arrival
+from ..world.types import GameState
+from ..world.fleet_tracker import build_arrival_ledger
+from ..world.combat import simulate_planet_timeline
+from ..engine.prediction import comet_remaining_life
+
+# 舰队可靠性阈值
+MAX_SAFE_DISTANCE = 70.0          # 不经验证的最大瞄准距离
+COMET_MIN_LIFE_FOR_CAPTURE = 4    # 彗星至少剩余回合数才考虑攻占
+
+
+@dataclass
+class Action:
+    """单次舰队发射动作。"""
+    source_id: int
+    target_id: int
+    ships: int
+    angle: float
+    eta: float
+    player: int
+    distance: float
+    target_ships: int = 0
+    needed: int = 0
+
+    def is_pass(self) -> bool:
+        return self.target_id == -1
+
+    @property
+    def sufficient(self) -> bool:
+        """舰船数是否足以攻占目标。"""
+        return self.ships >= self.needed if self.needed > 0 else True
+
+    def key(self) -> tuple:
+        return (self.source_id, self.target_id, self.ships)
+
+
+def enumerate_actions(state: GameState, player: int,
+                      max_candidates: int = 30,
+                      max_distance: float | None = None) -> list:
+    """枚举指定玩家的所有可行舰队发射动作。
+
+    策略：
+    1. 对玩家的每颗行星，计算可用舰船（ships - keep_needed）
+    2. 对每对 (source=己方, target≠己方)，调用 aim_at() 获取角度和 ETA
+    3. check_path_blocked() 过滤被阻挡的路径
+    4. 尝试多种舰船规模（基于攻占所需兵力）
+    5. 按距离升序排列，取 top max_candidates
+    6. 始终包含"不行动"（空列表）
+
+    Args:
+        state: 当前游戏状态
+        player: 执行动作的玩家 ID
+        max_candidates: 返回的最大候选动作数
+        max_distance: 限制搜索半径（渐进式展开用），None=无限制
+
+    Returns:
+        Action 列表（含 pass 动作），按距离排序
+    """
+    actions = []
+    ledger = build_arrival_ledger(state.fleets, state.planets)
+    horizon = min(state.remaining_steps, 110)
+
+    owned = state.my_planets if player == state.player else state.enemy_planets
+
+    for src in owned:
+        arrivals = ledger.get(src.id, [])
+        timeline = simulate_planet_timeline(src, arrivals, player, horizon)
+        keep_needed = timeline.get("keep_needed", 0)
+
+        # 彗星源特殊处理：过期后无防守需求，接近过期时放开所有舰船用于撤离
+        if src.id in state.comet_ids:
+            comet_life_src = comet_remaining_life(src.id, state.comets)
+            if comet_life_src <= 3:
+                keep_needed = 0  # 即将消失，尽快撤离全部驻军
+            elif comet_life_src <= 6:
+                keep_needed = min(keep_needed, max(0, src.ships // 4))
+
+        available = max(0, src.ships - keep_needed)
+
+        if available < 1:
+            continue
+
+        for tgt in state.planets:
+            if tgt.id == src.id:
+                continue
+            if tgt.owner == player:
+                continue
+
+            d = dist(src.x, src.y, tgt.x, tgt.y)
+            if max_distance is not None and d > max_distance:
+                continue
+
+            # aim_at 获取角度和 ETA（粗略，用最大可用舰船）
+            result = aim_at(
+                src, tgt, max(1, available),
+                state.initial_by_id, state.angular_velocity,
+                state.comets, state.comet_ids,
+            )
+            if result is None:
+                continue
+            angle, eta, _, _ = result
+            eta = float(eta)
+
+            if eta > state.remaining_steps:
+                continue
+
+            # 计算攻占所需兵力（彗星寿命感知）
+            target_ships = tgt.ships
+            needed = _compute_needed(tgt, eta, player, target_ships, state.comets, state.comet_ids)
+
+            # 剪枝：available 甚至不到 needed 的一半 → 没戏
+            if available < needed * 0.5:
+                continue
+
+            # 尝试多种舰船规模
+            ship_scales = _compute_ship_scales(available, tgt, eta, player, state.comets, state.comet_ids)
+
+            for s in ship_scales:
+                if s < 1 or s > available:
+                    continue
+                r = aim_at(
+                    src, tgt, max(1, s),
+                    state.initial_by_id, state.angular_velocity,
+                    state.comets, state.comet_ids,
+                )
+                if r is None:
+                    continue
+                act_angle, act_eta, _, _ = r
+
+                if act_eta > state.remaining_steps:
+                    continue
+
+                # 前向模拟验证（替代 check_path_blocked，使用与游戏引擎相同的 swept-pair 数学）
+                # 同时检测：路径阻挡、飞出边界、撞太阳、是否能到达目标
+                valid, hit_turn, reason = validate_fleet_arrival(src, tgt, max(1, s), act_angle, state)
+                if not valid:
+                    continue
+
+                # 彗星寿命过滤：只攻占寿命足够的彗星（跳过寿命太短的中性彗星）
+                is_comet_target = tgt.id in state.comet_ids
+                if is_comet_target and tgt.owner != player:
+                    comet_life = comet_remaining_life(tgt.id, state.comets)
+                    if comet_life < COMET_MIN_LIFE_FOR_CAPTURE and tgt.owner == -1:
+                        continue  # 中性彗星寿命太短，攻占不划算
+
+                actions.append(Action(
+                    source_id=src.id,
+                    target_id=tgt.id,
+                    ships=s,
+                    angle=act_angle,
+                    eta=float(act_eta),
+                    player=player,
+                    distance=d,
+                    target_ships=target_ships,
+                    needed=needed,
+                ))
+
+    # 按距离排序
+    actions.sort(key=lambda a: a.distance)
+
+    # 去重
+    unique_actions = _deduplicate_actions(actions)
+
+    # 截断
+    result = unique_actions[:max_candidates]
+
+    # 始终包含 pass 动作
+    result.append(Action(source_id=-1, target_id=-1, ships=0, angle=0.0, eta=0.0, player=player, distance=0.0))
+
+    return result
+
+
+def _compute_needed(target, eta: float, player: int, raw_garrison: int, comets=None, comet_ids=None) -> int:
+    """计算攻占该目标至少需要的舰船数。
+
+    彗星 garrison 增长上限为 min(eta, comet_remaining_life) 而非 min(eta, 50)。
+    """
+    garrison = raw_garrison
+    if target.owner != -1 and target.owner != player:
+        growth_cap = min(eta, 50)
+        if comet_ids and target.id in comet_ids and comets:
+            comet_life = comet_remaining_life(target.id, comets)
+            growth_cap = min(eta, comet_life)
+        garrison += target.production * growth_cap
+    return max(1, int(garrison * 1.1))
+
+
+def _compute_ship_scales(available: int, target, eta: float, player: int, comets=None, comet_ids=None) -> list:
+    """计算要尝试的舰船规模——基于攻占所需兵力。
+
+    派送不足 needed 的舰队 = 纯送死，不产生候选。
+    多源合击场景由 MCTS 动作集层面处理。
+    """
+    needed = _compute_needed(target, eta, player, target.ships, comets, comet_ids)
+    scales = []
+    for mult in [0.9, 1.0, 1.2, 1.5, 2.0]:
+        s = int(needed * mult)
+        if 1 <= s <= available and s not in scales:
+            scales.append(s)
+    # 全押兜底
+    if available not in scales and available >= 1:
+        scales.append(available)
+    return sorted(set(scales))
+
+
+def _deduplicate_actions(actions: list) -> list:
+    """去重：相同 (source_id, target_id, ships) 精确去重。"""
+    if not actions:
+        return []
+    seen = set()
+    result = []
+    for a in actions:
+        key = a.key()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(a)
+    return result
+
+
+def progressive_expand_actions(state: GameState, player: int,
+                                iteration_count: int,
+                                max_candidates: int = 30) -> list:
+    """根据迭代次数渐进式展开动作池。
+
+    阶段 0 (iter 0-100): 近距离目标 (distance ≤ 30)
+    阶段 1 (iter 100-300): 中等距离 (distance ≤ 60)
+    阶段 2 (iter 300+): 全图
+    """
+    if iteration_count < 100:
+        max_dist = 30.0
+    elif iteration_count < 300:
+        max_dist = 60.0
+    else:
+        max_dist = None
+
+    return enumerate_actions(state, player, max_candidates=max_candidates, max_distance=max_dist)
