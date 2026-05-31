@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 
 from ..engine.interception import aim_at, check_path_blocked
+from ..engine.prediction import comet_remaining_life
 from ..world.combat import simulate_planet_timeline
 
 
@@ -74,8 +75,9 @@ def simulate_fleet_launch(src, tgt, ships_to_send, state, ledger, timelines):
     original_arrivals = list(ledger.get(tgt.id, []))
     new_arrivals = original_arrivals + [(eta, state.player, ships)]
     sim_horizon = max(1, state.remaining_steps)
+    tgt_life = comet_remaining_life(tgt.id, state.comets) if tgt.id in state.comet_ids else None
     new_timeline = simulate_planet_timeline(
-        tgt, new_arrivals, state.player, sim_horizon,
+        tgt, new_arrivals, state.player, sim_horizon, planet_life=tgt_life,
     )
     outcome.new_timeline = new_timeline
 
@@ -171,8 +173,9 @@ def simulate_multi_fleet_launch(sources, tgt, state, ledger, timelines):
         }
 
     sim_horizon = max(1, state.remaining_steps)
+    tgt_life2 = comet_remaining_life(tgt.id, state.comets) if tgt.id in state.comet_ids else None
     new_timeline = simulate_planet_timeline(
-        tgt, new_arrivals, state.player, sim_horizon,
+        tgt, new_arrivals, state.player, sim_horizon, planet_life=tgt_life2,
     )
 
     capture_turn = None

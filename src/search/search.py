@@ -14,6 +14,7 @@ import math
 
 from ..engine.physics import travel_time
 from ..engine.interception import aim_at, check_path_blocked
+from ..engine.prediction import comet_remaining_life
 from .simulator import simulate_fleet_launch, find_min_ships_to_capture
 from .simulator import simulate_multi_fleet_launch
 from .valuation import compute_action_value, value_of_capture, lookahead_adjustment
@@ -287,6 +288,62 @@ def search_best_actions(state, ledger, timelines, top_k=20,
                         source_at_risk=True, is_enemy=False,
                     ))
 
+        # ── 彗星撤离: 彗星即将消失，必须在消失前最后一回合撤离全部驻军 ──
+        # 回合顺序: 彗星消失(Step 1) → 舰队发射(Step 3)
+        # life == 1 是本回合能发射的最后机会，下一回合彗星消失时驻军全毁
+        for src in state.my_planets:
+            if src.id not in state.comet_ids:
+                continue
+            comet_life = comet_remaining_life(src.id, state.comets)
+            if comet_life > 1:
+                continue
+            remaining_ships = int(src.ships)
+            if remaining_ships < 1:
+                continue
+
+            # 找最近的安全友方行星（非彗星优先，彗星需剩余寿命 > 3）
+            best_target = None
+            best_dist = float("inf")
+            for mp in state.my_planets:
+                if mp.id == src.id:
+                    continue
+                if mp.id in state.comet_ids:
+                    tgt_life = comet_remaining_life(mp.id, state.comets)
+                    if tgt_life <= 3:
+                        continue
+                mp_timeline = timelines.get(mp.id, {})
+                mp_fall = mp_timeline.get("fall_turn")
+                if mp_fall is not None:
+                    continue
+                d = math.hypot(mp.x - src.x, mp.y - src.y)
+                if d < best_dist:
+                    best_dist = d
+                    best_target = mp
+
+            if best_target is None:
+                continue
+
+            evacuate_eta = travel_time(
+                src.x, src.y, src.radius,
+                best_target.x, best_target.y, best_target.radius,
+                max(1, remaining_ships),
+            )
+
+            # 撤离价值: 保存的舰船 = 直接避免的分数损失
+            # 舰队一旦发射就安全了，彗星消失不影响在途舰队
+            saved_value = remaining_ships * 1.2
+            time_cost = evacuate_eta * 0.5
+            evacuate_value = saved_value - time_cost
+
+            if evacuate_value > 0:
+                results.append(ScoredAction(
+                    source_id=src.id, target_id=best_target.id,
+                    ships=remaining_ships, value=evacuate_value,
+                    capture_turn=None, hold_until=None,
+                    eta=int(evacuate_eta), source_available=remaining_ships,
+                    source_at_risk=True, is_enemy=False,
+                ))
+
     results.sort(key=lambda a: a.value, reverse=True)
     return results[:top_k]
 
@@ -517,8 +574,10 @@ def search_agent_act(state, ledger=None, timelines=None):
     if timelines is None:
         timelines = {}
         for p in state.planets:
+            life = comet_remaining_life(p.id, state.comets) if p.id in state.comet_ids else None
             timelines[p.id] = simulate_planet_timeline(
                 p, ledger.get(p.id, []), state.player, state.remaining_steps,
+                planet_life=life,
             )
 
     # ── 第 1 层: 单源攻击 + 防御搜索 ──

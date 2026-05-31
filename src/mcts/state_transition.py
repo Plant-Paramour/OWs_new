@@ -113,6 +113,20 @@ def step_state(state: GameState, actions: dict) -> GameState:
     comets = copy.deepcopy(state.comets)
     player = state.player
 
+    # ── 0. 彗星过期（回合开始，在舰队发射之前）──
+    # 回合顺序: 彗星消失(Step 1) → 彗星生成 → 舰队发射(Step 3)
+    # path_index >= len(path) 表示彗星已到达轨迹终点，本回合开始时移除
+    expired_ids = set()
+    for group in comets:
+        pids = group.get("planet_ids", [])
+        paths = group.get("paths", [])
+        path_index = group.get("path_index", 0)
+        for pi, pid in enumerate(pids):
+            if pi < len(paths) and path_index >= len(paths[pi]):
+                expired_ids.add(pid)
+    if expired_ids:
+        new_planets = [p for p in new_planets if p.id not in expired_ids]
+
     # 生成新舰队 ID
     max_fid = max((f.id for f in new_fleets), default=0)
 

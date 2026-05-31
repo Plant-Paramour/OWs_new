@@ -8,6 +8,7 @@ from ..world.observation import parse_observation
 from ..world.fleet_tracker import build_arrival_ledger
 from ..world.combat import simulate_planet_timeline
 from ..engine.interception import aim_at
+from ..engine.prediction import comet_remaining_life
 from ..search.search import search_best_actions
 
 
@@ -34,8 +35,10 @@ class SearchOpponent:
         ledger = build_arrival_ledger(state.fleets, state.planets)
         timelines = {}
         for p in state.planets:
+            life = comet_remaining_life(p.id, state.comets) if p.id in state.comet_ids else None
             timelines[p.id] = simulate_planet_timeline(
                 p, ledger.get(p.id, []), state.player, state.remaining_steps,
+                planet_life=life,
             )
 
         results = search_best_actions(state, ledger, timelines, top_k=self.top_k)

@@ -69,10 +69,17 @@ def normalize_arrivals(arrivals: list, horizon: int) -> list:
 
 
 def simulate_planet_timeline(planet, arrivals: list, player: int,
-                              horizon: int) -> dict:
+                              horizon: int, planet_life: int | None = None) -> dict:
     """模拟行星在 horizon 回合内的完整时间线。
 
     构建一个可复用的未来状态模型，供防御、占领和撤离决策共同查询。
+
+    Args:
+        planet: 行星对象
+        arrivals: 到达列表 [(eta, owner, ships), ...]
+        player: 我方玩家 ID
+        horizon: 模拟视野（回合数）
+        planet_life: 行星剩余寿命（彗星用），None 表示永不过期
 
     Returns:
         {
@@ -81,7 +88,7 @@ def simulate_planet_timeline(planet, arrivals: list, player: int,
             "keep_needed": int,              # 所需最低保留舰船
             "min_owned": int,                # 我方拥有时的最小驻军
             "first_enemy": int | None,       # 首波敌军到达回合
-            "fall_turn": int | None,         # 失守回合
+            "fall_turn": int | None,         # 失守回合（含彗星过期）
             "holds_full": bool,              # 全量舰船是否能守住
             "horizon": int,
         }
@@ -101,6 +108,18 @@ def simulate_planet_timeline(planet, arrivals: list, player: int,
     fall_turn = None
 
     for turn in range(1, horizon + 1):
+        # 彗星过期: planet_life 回合后，下一回合开始时（生产前）彗星消失
+        # comet_remaining_life == N 表示 survivable 回合数为 N
+        # 即 turn 1..N 正常，turn N+1 开始彗星已消失
+        if planet_life is not None and turn > planet_life:
+            if owner == player and fall_turn is None:
+                fall_turn = turn
+            owner = -1
+            garrison = 0.0
+            owner_at[turn] = -1
+            ships_at[turn] = 0.0
+            continue
+
         if owner != -1:
             garrison += planet.production
 

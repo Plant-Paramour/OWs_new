@@ -1,7 +1,8 @@
-"""MCTS 核心搜索引擎 —— 完整动作集合 UCB 搜索。
+"""MCTS 博弈树搜索引擎 —— minimax 深度搜索。
 
-每个 MCTS 子节点 = 一个完整的本回合动作集合（多行星同时行动）。
-每轮迭代: Select(UCB1) → Simulate(full turn + deep rollout) → Backprop
+二层树结构：
+  Level 0 (root, 我方回合): 我方动作集 → Level 1 (敌方回合): 敌方回应 → 评估
+每轮迭代: Select(UCB1, 我方max/敌方min) → Expand → Simulate → Backprop
 """
 
 import math
@@ -10,14 +11,12 @@ import random
 from dataclasses import dataclass, field
 
 from ..world.types import GameState
-from ..world.fleet_tracker import build_arrival_ledger
-from ..world.combat import simulate_planet_timeline
 from .state_transition import clone_state, step_state
 from .action_space import Action, enumerate_actions
-from .value import (
-    build_baseline_timelines, build_baseline_ledger,
-    player_value_from_state, action_impact,
-)
+from .value import build_baseline_timelines, player_value_from_timelines
+
+# 敌方回应采样上限
+MAX_ENEMY_CHILDREN = 12
 
 
 @dataclass
@@ -25,6 +24,7 @@ class MCTSNode:
     """MCTS 树节点——代表一个完整的动作集合。"""
     actions: list = field(default_factory=list)
     parent: "MCTSNode | None" = None
+    is_enemy: bool = False
 
     visits: int = 0
     total_value: float = 0.0
@@ -37,36 +37,64 @@ class MCTSNode:
             return 0.0
         return self.total_value / self.visits
 
+    @property
+    def minimax_value(self) -> float:
+        """当前 minimax 估值。
+        敌方节点 = avg_value（直接评估）。
+        我方节点 = min over 敌方子节点（最坏情况）。
+        """
+        if self.is_enemy or not self.children:
+            return self.avg_value
+        worst = float("inf")
+        for child in self.children.values():
+            if child.visits > 0:
+                worst = min(worst, child.avg_value)
+        return worst if worst != float("inf") else self.avg_value
+
 
 class MCTSSearch:
-    """完整动作集合 MCTS 搜索引擎。
+    """Minimax MCTS 搜索引擎。
 
-    每个根子节点是一组完整的本回合动作（所有行星的发射决定）。
-    UCB1 选择最有前景的动作集合，深度 rollout 到终局附近进行评估。
+    我方节点选 max UCB，敌方节点选 min UCB。
+    每次模拟：步进我方+敌方动作 → 短 rollout → 时间线评估。
     """
 
-    def __init__(self, C: float = 1.414, time_budget_ms: int = 900):
+    def __init__(self, C: float = 100, time_budget_ms: int = 950):
         self.C = C
         self.time_budget_ms = time_budget_ms
         self.root = None
         self.iteration = 0
         self.root_state = None
         self.player = 0
+        self.enemy = 1
+        self._fixed_enemy_sets = []  # 所有我方节点共享的固定敌方回应
 
     def search(self, root_state: GameState) -> list:
-        """MCTS 搜索，返回本回合最优动作列表。"""
         start_time = time.monotonic()
         self.root_state = root_state
         self.player = root_state.player
+        self.enemy = 1 - self.player
 
-        action_sets = self._generate_action_sets(root_state)
-
-        if not action_sets:
+        # 生成我方动作集
+        my_action_sets = self._generate_action_sets(root_state, self.player)
+        if not my_action_sets:
             return []
 
+        # 预生成敌方全部合法动作，固定顺序供所有我方节点共享比较
+        enemy_all = enumerate_actions(root_state, self.enemy, max_candidates=80)
+        enemy_real = [a for a in enemy_all if not a.is_pass()]
+        all_enemy_sets = self._build_action_sets(enemy_real)
+        if not all_enemy_sets:
+            all_enemy_sets = [[]]
+        # 固定顺序：打乱一次后固定，所有我方节点共享同一套敌方回应
+        rng = random.Random(42)
+        rng.shuffle(all_enemy_sets)
+        self._fixed_enemy_sets = all_enemy_sets[:MAX_ENEMY_CHILDREN]
+
+        # 构建二层树
         self.root = MCTSNode()
-        for i, acts in enumerate(action_sets):
-            child = MCTSNode(actions=acts, parent=self.root)
+        for i, acts in enumerate(my_action_sets):
+            child = MCTSNode(actions=acts, parent=self.root, is_enemy=False)
             self.root.children[i] = child
 
         self.iteration = 0
@@ -74,46 +102,51 @@ class MCTSSearch:
         while not self._time_up(start_time):
             self.iteration += 1
 
-            child = self._select()
-            value = self._simulate_action_set(child.actions)
-            self._backpropagate(child, value)
+            # 1. Select: 遍历二层树到叶子
+            my_node, enemy_node = self._select()
+            if my_node is None:
+                continue
+
+            # 2. Expand: 为敌方节点层添加新回应
+            if enemy_node is None:
+                enemy_node = self._expand_enemy(my_node)
+
+            if enemy_node is None:
+                continue
+
+            # 3. Simulate
+            value = self._evaluate(my_node.actions, enemy_node.actions)
+
+            # 4. Backprop
+            self._backpropagate(enemy_node, my_node, value)
 
         return self._best_actions()
 
-    def _generate_action_sets(self, state: GameState) -> list:
-        """生成候选动作集合池。
+    # ── 动作集生成 ───────────────────────────────────────────
 
-        策略：
-        1. 为每个行星选最优 (source, target) 对（优先 sufficient+近距离）
-        2. 生成多个变体（不同舰船规模、单行星 pass）
-        3. 始终包含"全 pass"候选
-        """
-        all_actions = enumerate_actions(state, self.player, max_candidates=80)
+    def _generate_action_sets(self, state: GameState, player: int) -> list:
+        """生成候选动作集合池。"""
+        all_actions = enumerate_actions(state, player, max_candidates=80)
         real_actions = [a for a in all_actions if not a.is_pass()]
 
         if not real_actions:
             return [[]]
 
-        # 按行星分组
         by_source = {}
         for a in real_actions:
             by_source.setdefault(a.source_id, []).append(a)
 
-        # 基线：每个行星选最优动作（优先 sufficient + 近距离）
         baseline = []
         for src_id, acts in by_source.items():
             sufficient = [a for a in acts if a.sufficient]
             if sufficient:
-                sufficient.sort(key=lambda a: a.distance)
+                sufficient.sort(key=lambda a: (a.distance, -a.ships))
                 baseline.append(sufficient[0])
-            else:
-                acts.sort(key=lambda a: (-a.ships, a.distance))
-                baseline.append(acts[0])
+            # 无足够兵力的源不纳入 baseline——solo 必败动作未来价值为负
 
-        # 总是包含"全 pass"作为候选策略
         action_sets = [baseline, []]
 
-        # 生成变体：扰动舰船规模
+        # 单源变体：替换同一源的舰船数
         for i, base_act in enumerate(baseline):
             src_id = base_act.source_id
             variants = by_source.get(src_id, [])
@@ -123,14 +156,16 @@ class MCTSSearch:
                     variant[i] = v
                     action_sets.append(variant)
 
-        # 试试"单行星 pass"（不发兵）
+        # 单源放弃：某个源不出兵
         if len(baseline) > 1:
             for i in range(len(baseline)):
                 variant = [a for j, a in enumerate(baseline) if j != i]
                 if variant:
                     action_sets.append(variant)
 
-        # 去重
+        # 合击变体：多源指向同一目标，联合兵力攻占
+        action_sets.extend(self._joint_strike_variants(baseline, by_source))
+
         seen = set()
         unique = []
         for acts in action_sets:
@@ -139,103 +174,255 @@ class MCTSSearch:
                 seen.add(key)
                 unique.append(acts)
 
-        return unique[:60]
+        return unique[:50]
 
-    def _select(self) -> MCTSNode:
-        """UCB1 选择。"""
-        best_child = None
-        best_ucb = -float("inf")
+    def _joint_strike_variants(self, baseline: list, by_source: dict) -> list:
+        """生成多星合击变体：多个源行星共同打击同一目标。
 
-        for key, child in self.root.children.items():
+        仅在无单源能独立攻占时考虑合击。每对源取前 4 舰船规模组合。
+        """
+        variants = []
+        src_to_idx = {act.source_id: i for i, act in enumerate(baseline)}
+
+        # 按目标分组：{target_id: [(source_id, action)]}
+        by_target = {}
+        for src_id, acts in by_source.items():
+            for a in acts:
+                by_target.setdefault(a.target_id, []).append((src_id, a))
+
+        for target_id, pairs in by_target.items():
+            # 已有单源足够攻占 → 不需要合击
+            if any(a.sufficient for _, a in pairs):
+                continue
+
+            # 各源对该目标的最优行动
+            src_best = {}
+            for src_id, a in pairs:
+                if src_id not in src_best or a.ships > src_best[src_id].ships:
+                    src_best[src_id] = a
+
+            src_list = list(src_best.items())
+            if len(src_list) < 2:
+                continue
+
+            needed = max(a.needed for _, a in src_list)
+
+            # 尝试每对源，组合舰船规模
+            for si in range(min(len(src_list), 4)):
+                for sj in range(si + 1, min(len(src_list), 4)):
+                    src_a, _ = src_list[si]
+                    src_b, _ = src_list[sj]
+
+                    src_a_acts = [a for sid, a in pairs if sid == src_a][:4]
+                    src_b_acts = [a for sid, a in pairs if sid == src_b][:4]
+
+                    for aa in src_a_acts:
+                        for ab in src_b_acts:
+                            if aa.ships + ab.ships < needed:
+                                continue
+                            variant = list(baseline)
+                            idx_a = src_to_idx.get(src_a)
+                            idx_b = src_to_idx.get(src_b)
+                            if idx_a is not None:
+                                variant[idx_a] = aa
+                            else:
+                                variant.append(aa)
+                            if idx_b is not None:
+                                variant[idx_b] = ab
+                            else:
+                                variant.append(ab)
+                            variants.append(variant)
+
+        return variants[:15]
+
+    def _build_action_sets(self, actions: list) -> list:
+        """从动作列表构建动作集合（按行星分组+扰动）。"""
+        if not actions:
+            return [[]]
+
+        by_source = {}
+        for a in actions:
+            by_source.setdefault(a.source_id, []).append(a)
+
+        baseline = []
+        for src_id, acts in by_source.items():
+            sufficient = [a for a in acts if a.sufficient]
+            if sufficient:
+                sufficient.sort(key=lambda a: (a.distance, -a.ships))
+                baseline.append(sufficient[0])
+            # 无足够兵力的源不纳入 baseline——solo 必败动作未来价值为负
+
+        sets = [baseline, []]
+
+        for i, base_act in enumerate(baseline):
+            variants = by_source.get(base_act.source_id, [])
+            for v in variants[:4]:
+                if v.ships != base_act.ships:
+                    variant = list(baseline)
+                    variant[i] = v
+                    sets.append(variant)
+
+        if len(baseline) > 1:
+            for i in range(len(baseline)):
+                variant = [a for j, a in enumerate(baseline) if j != i]
+                if variant:
+                    sets.append(variant)
+
+        seen = set()
+        unique = []
+        for acts in sets:
+            key = tuple(sorted((a.source_id, a.target_id, a.ships) for a in acts))
+            if key not in seen:
+                seen.add(key)
+                unique.append(acts)
+
+        return unique[:30]
+
+    # ── 树遍历 ────────────────────────────────────────────────
+
+    def _select(self) -> tuple:
+        """二层树选择：我方层 max UCB → 敌方层 min UCB。
+
+        Returns:
+            (my_node, enemy_node_or_None)
+        """
+        # Level 1: 我方节点（max UCB）
+        my_node = self._select_child(self.root, maximize=True)
+        if my_node is None:
+            return None, None
+        if my_node.visits == 0:
+            return my_node, None  # 未探索过，需要扩展敌方回应
+
+        # Level 2: 敌方节点（min UCB）
+        if not my_node.children:
+            return my_node, None  # 需要扩展
+
+        enemy_node = self._select_child(my_node, maximize=False)
+        return my_node, enemy_node
+
+    def _select_child(self, parent: MCTSNode, maximize: bool) -> MCTSNode | None:
+        """选择 UCB 最优子节点。maximize=True 选最大，False 选最小（敌方视角）。
+
+        使用 minimax_value 作为 exploit，确保博弈树估值正确传导。
+        """
+        if not parent.children:
+            return None
+
+        best = None
+        best_ucb = -float("inf") if maximize else float("inf")
+
+        for child in parent.children.values():
             if child.visits == 0:
-                return child
-            exploit = child.avg_value
-            explore = self.C * math.sqrt(math.log(self.root.visits + 1) / child.visits)
-            ucb = exploit + explore
-            if ucb > best_ucb:
+                return child  # 优先探索未访问节点
+            exploit = child.minimax_value
+            explore = self.C * math.sqrt(math.log(parent.visits + 1) / child.visits)
+            ucb = exploit + explore if maximize else exploit - explore
+            if (maximize and ucb > best_ucb) or (not maximize and ucb < best_ucb):
                 best_ucb = ucb
-                best_child = child
+                best = child
 
-        return best_child if best_child else next(iter(self.root.children.values()))
+        return best
 
-    def _simulate_action_set(self, my_actions: list) -> float:
-        """模拟完整回合：我方动作集合 + 敌方启发式 + 深度 rollout。"""
+    def _expand_enemy(self, my_node: MCTSNode) -> MCTSNode | None:
+        """为我方节点扩展固定的敌方回应子节点。
+
+        所有我方节点按相同顺序使用 self._fixed_enemy_sets，
+        确保 minimax 比较建立在一致的敌方回应基础上。
+        """
+        max_children = min(len(self._fixed_enemy_sets), MAX_ENEMY_CHILDREN)
+        next_idx = len(my_node.children)
+        if next_idx >= max_children:
+            return None
+
+        enemy_acts = self._fixed_enemy_sets[next_idx]
+        child = MCTSNode(actions=enemy_acts, parent=my_node, is_enemy=True)
+        my_node.children[next_idx] = child
+        return child
+
+    @staticmethod
+    def _action_key(actions: list) -> tuple:
+        return tuple(sorted((a.source_id, a.target_id, a.ships) for a in actions))
+
+    # ── 模拟与评估 ────────────────────────────────────────────
+
+    def _evaluate(self, my_actions: list, enemy_actions: list) -> float:
+        """步进状态 → 时间线评估 → 原始未来价值差 (my_val - enemy_val)。
+
+        不做归一化——价值差直接决定输赢，任何数学变换都会破坏决策信号。
+        额外尝试 0/3/6 回合双方 pass 后的局面，取最优值。
+        """
         sim_state = clone_state(self.root_state)
 
-        my_acts = list(my_actions)
-
-        # 敌方动作（启发式）
-        enemy_acts = self._heuristic_actions(sim_state, 1, [])
-
-        # step
         actions = {
-            self.player: [[a.source_id, a.angle, a.ships] for a in my_acts],
-            1: [[a.source_id, a.angle, a.ships] for a in enemy_acts],
+            self.player: [[a.source_id, a.angle, a.ships] for a in my_actions],
+            self.enemy: [[a.source_id, a.angle, a.ships] for a in enemy_actions],
         }
         sim_state = step_state(sim_state, actions)
 
-        # 深度 rollout
-        remaining = sim_state.remaining_steps
-        if remaining <= 20:
-            rd = remaining - 1
-        elif remaining <= 100:
-            rd = 40
-        elif remaining <= 300:
-            rd = 60
-        else:
-            rd = 50
+        best_val = self._eval_state(sim_state)
 
-        for _ in range(rd):
-            if sim_state.remaining_steps <= 1:
-                break
-            my_a = self._heuristic_actions(sim_state, self.player, [])
-            enemy_a = self._heuristic_actions(sim_state, 1, [])
-            acts = {
-                self.player: [[a.source_id, a.angle, a.ships] for a in my_a],
-                1: [[a.source_id, a.angle, a.ships] for a in enemy_a],
-            }
-            sim_state = step_state(sim_state, acts)
+        for wait_turns in (3, 6):
+            if wait_turns >= sim_state.remaining_steps:
+                continue
+            wait_state = clone_state(sim_state)
+            for _ in range(wait_turns):
+                wait_state = step_state(wait_state, {0: [], 1: []})
+            wait_val = self._eval_state(wait_state)
+            if wait_val > best_val:
+                best_val = wait_val
 
-        # 评估
-        val = player_value_from_state(sim_state)
+        return best_val
+
+    def _eval_state(self, state: GameState) -> float:
+        timelines = build_baseline_timelines(state)
+        val = player_value_from_timelines(timelines, state.planets, state.remaining_steps)
         my_val = val.get(self.player, 0)
-        enemy_val = val.get(1 - self.player, 0)
-        total = my_val + enemy_val
-        if total > 0:
-            advantage = (my_val - enemy_val) / total
-            return (advantage + 1.0) / 2.0
-        return 0.5
+        enemy_val = val.get(self.enemy, 0)
+        return my_val - enemy_val
 
-    def _backpropagate(self, child: MCTSNode, value: float):
-        current = child
-        while current is not None:
-            current.visits += 1
-            current.total_value += value
-            current = current.parent
+    # ── 回溯 ──────────────────────────────────────────────────
+
+    def _backpropagate(self, enemy_node: MCTSNode, my_node: MCTSNode, value: float):
+        """二层回溯。敌方节点累加评估值；我方节点只计访问次数。
+
+        minimax_value 由属性实时从敌方子节点计算，不依赖 total_value。
+        """
+        enemy_node.visits += 1
+        enemy_node.total_value += value
+        my_node.visits += 1
+        self.root.visits += 1
+
+    # ── 最优动作选择 ──────────────────────────────────────────
 
     def _best_actions(self) -> list:
-        """选择访问次数最多的动作集合。"""
+        """选 minimax 最优动作集：我方节点中 minimax_value 最高者。
+
+        对每个我方节点，其 minimax_value = min over 敌方回应（最坏情况估值）。
+        选最坏情况下最好的动作（maximin）。
+        """
         if not self.root or not self.root.children:
             return []
 
         best_child = None
-        best_visits = -1
+        best_value = -float("inf")
         for child in self.root.children.values():
-            if child.visits > best_visits:
-                best_visits = child.visits
+            if child.visits > 0 and child.minimax_value > best_value:
+                best_value = child.minimax_value
                 best_child = child
 
         if best_child is None:
+            for child in self.root.children.values():
+                if child.actions:
+                    return [[a.source_id, a.angle, a.ships] for a in child.actions]
             return []
 
         return [[a.source_id, a.angle, a.ships] for a in best_child.actions]
 
+    # ── 启发式动作（rollout 用）─────────────────────────────────
+
     def _heuristic_actions(self, sim_state: GameState, player: int,
                             already_committed: list) -> list:
-        """快速启发式动作选择（用于 rollout）。
-
-        只派遣足以攻占目标的兵力，不足则不派。
-        """
+        """快速启发式动作选择。只派遣足以攻占目标的兵力。"""
         used = {}
         for a in already_committed:
             sid = a.source_id if hasattr(a, 'source_id') else a[0]
@@ -264,14 +451,12 @@ class MCTSSearch:
             if best_tgt is None:
                 continue
 
-            # 计算攻占所需兵力
             eta_est = best_dist / 3.0
             garrison = best_tgt.ships
             if best_tgt.owner != -1 and best_tgt.owner != player:
                 garrison += best_tgt.production * min(eta_est, 50)
             needed = max(1, int(garrison * 1.1))
 
-            # 兵力不足则不浪费舰船
             if avail < needed:
                 continue
 
@@ -279,7 +464,8 @@ class MCTSSearch:
             angle = math.atan2(best_tgt.y - src.y, best_tgt.x - src.x)
 
             from ..engine.physics import safe_angle_and_distance
-            safe = safe_angle_and_distance(src.x, src.y, src.radius, best_tgt.x, best_tgt.y, best_tgt.radius)
+            safe = safe_angle_and_distance(src.x, src.y, src.radius,
+                                           best_tgt.x, best_tgt.y, best_tgt.radius)
             if safe is not None:
                 angle = safe[0]
 
@@ -289,4 +475,4 @@ class MCTSSearch:
         return actions
 
     def _time_up(self, start_time: float) -> bool:
-        return (time.monotonic() - start_time) * 1000 > self.time_budget_ms - 30
+        return (time.monotonic() - start_time) * 1000 > self.time_budget_ms - 50
