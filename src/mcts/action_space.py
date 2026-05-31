@@ -12,7 +12,7 @@ from ..engine.physics import dist
 from ..engine.validation import validate_fleet_arrival
 from ..world.types import GameState
 from ..world.fleet_tracker import build_arrival_ledger
-from ..world.combat import simulate_planet_timeline
+from ..world.combat import simulate_planet_timeline, state_at_timeline
 from ..engine.prediction import comet_remaining_life
 
 # 舰队验证：validate_fleet_arrival() 使用与游戏引擎相同的 swept-pair 数学，
@@ -71,12 +71,17 @@ def enumerate_actions(state: GameState, player: int,
     ledger = build_arrival_ledger(state.fleets, state.planets)
     horizon = min(state.remaining_steps, 110)
 
+    # 为所有行星构建基线时间线投影 —— 用于判断目标在舰队到达时是否已被友军占领
+    target_timelines = {}
+    for p in state.planets:
+        arrivals = ledger.get(p.id, [])
+        life = comet_remaining_life(p.id, state.comets) if p.id in state.comet_ids else None
+        target_timelines[p.id] = simulate_planet_timeline(p, arrivals, player, horizon, planet_life=life)
+
     owned = state.my_planets if player == state.player else state.enemy_planets
 
     for src in owned:
-        arrivals = ledger.get(src.id, [])
-        src_life = comet_remaining_life(src.id, state.comets) if src.id in state.comet_ids else None
-        timeline = simulate_planet_timeline(src, arrivals, player, horizon, planet_life=src_life)
+        timeline = target_timelines.get(src.id, {})
         keep_needed = timeline.get("keep_needed", 0)
 
         # 彗星源特殊处理：过期后无防守需求，接近过期时放开所有舰船用于撤离
@@ -116,16 +121,28 @@ def enumerate_actions(state: GameState, player: int,
             if eta > state.remaining_steps:
                 continue
 
-            # 计算攻占所需兵力（彗星寿命感知）
-            target_ships = tgt.ships
-            needed = _compute_needed(tgt, eta, player, target_ships, state.comets, state.comet_ids)
+            # 时间线投影：舰队到达时目标是否已被友军在途舰队占领？
+            tl = target_timelines.get(tgt.id)
+            if tl:
+                proj_owner, proj_ships = state_at_timeline(tl, eta)
+                if proj_owner == player:
+                    continue  # 友军舰队会在我们到达前占领此目标
+                target_ships = int(proj_ships)
+                # 用投影 garrison 计算 needed（已计入生产增长和其他舰队影响）
+                if proj_owner == -1:
+                    needed = max(1, target_ships + 1)
+                else:
+                    needed = max(1, int(target_ships * 1.1) + 1)
+            else:
+                target_ships = tgt.ships
+                needed = _compute_needed(tgt, eta, player, target_ships, state.comets, state.comet_ids)
 
             # 剪枝：available 甚至不到 needed 的一半 → 没戏
             if available < needed * 0.5:
                 continue
 
             # 尝试多种舰船规模
-            ship_scales = _compute_ship_scales(available, tgt, eta, player, state.comets, state.comet_ids)
+            ship_scales = _compute_ship_scales(available, tgt, eta, player, state.comets, state.comet_ids, needed=needed)
 
             for s in ship_scales:
                 if s < 1 or s > available:
@@ -261,7 +278,7 @@ def _compute_needed(target, eta: float, player: int, raw_garrison: int, comets=N
     return max(1, garrison + 1)
 
 
-def _compute_ship_scales(available: int, target, eta: float, player: int, comets=None, comet_ids=None) -> list:
+def _compute_ship_scales(available: int, target, eta: float, player: int, comets=None, comet_ids=None, needed: int = None) -> list:
     """舰船规模选项——覆盖合击所需的全范围。
 
     舰队越大 → 速度越快 → ETA 越短。选项覆盖：
@@ -271,7 +288,8 @@ def _compute_ship_scales(available: int, target, eta: float, player: int, comets
       采样点  — available > 15 时在 1..available 间取 10 个代表值
     时间线评估会正确计入不同舰船数带来的 ETA 差异。
     """
-    needed = _compute_needed(target, eta, player, target.ships, comets, comet_ids)
+    if needed is None:
+        needed = _compute_needed(target, eta, player, target.ships, comets, comet_ids)
     scales = []
 
     if available <= 15:

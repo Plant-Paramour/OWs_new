@@ -124,48 +124,96 @@ class MCTSSearch:
 
     # ── 动作集生成 ───────────────────────────────────────────
 
+    def _greedy_allocate(self, actions, source_available):
+        """全局贪心分配：同一源舰船不超支，同一目标足够覆盖后不再追加。
+
+        只分配 sufficient 的动作——舰船不足以攻占目标的动作不纳入动作集。
+        非 sufficient 的动作由 _joint_strike_variants 专门探索合击。
+        """
+        used = {}
+        covered_targets = set()
+        result = []
+        for a in actions:
+            if not a.sufficient:
+                continue
+            sid, tid = a.source_id, a.target_id
+            avail = source_available.get(sid, 0)
+            if a.ships > avail - used.get(sid, 0):
+                continue
+            if tid in covered_targets:
+                continue
+            used[sid] = used.get(sid, 0) + a.ships
+            result.append(a)
+            covered_targets.add(tid)
+        return result
+
+    def _quick_action_score(self, action, comet_ids):
+        """快速启发式评分，用于全局贪心排序。高分优先分配。"""
+        score = 20.0
+        if action.sufficient:
+            score += 30.0
+        if action.target_id not in comet_ids:
+            score += 10.0
+        score -= action.distance * 0.2
+        if action.needed > 0 and action.ships > 0:
+            score += (action.needed / action.ships) * 15.0
+        return score
+
     def _generate_action_sets(self, state: GameState, player: int) -> list:
-        """生成候选动作集合池。"""
+        """生成候选动作集合池 —— 全局贪心分配 + 随机扰动。
+
+        所有候选动作全局排序后贪心分配，同一目标被足够兵力覆盖后
+        自然跳过冗余动作。随机打乱顺序产生多样化出牌组合，
+        MCTS 评估每种组合对应的场面，选出 maximin 最优。
+        """
         all_actions = enumerate_actions(state, player, max_candidates=80)
         real_actions = [a for a in all_actions if not a.is_pass()]
 
         if not real_actions:
             return [[]]
 
+        # 可用舰船 = actions 中每源的最大 ship count
+        # （enumerate_actions 已按 ships - keep_needed 限制，max ship = available）
+        source_available = {}
+        for a in real_actions:
+            sid = a.source_id
+            source_available[sid] = max(source_available.get(sid, 0), a.ships)
+
+        comet_ids = state.comet_ids
+        for a in real_actions:
+            a._heuristic_score = self._quick_action_score(a, comet_ids)
+
+        action_sets = [[]]  # 始终包含"全部 pass"
+
+        # 1. 启发式最优优先 → 基线动作集
+        sorted_actions = sorted(real_actions, key=lambda a: a._heuristic_score, reverse=True)
+        baseline = self._greedy_allocate(sorted_actions, dict(source_available))
+        if baseline:
+            action_sets.append(baseline)
+
+        # 2. 随机顺序扰动 → 多样化目标分配（C→D 而非 C→B）
+        for seed in range(10):
+            rng = random.Random(seed * 137 + 42)
+            shuffled = list(real_actions)
+            rng.shuffle(shuffled)
+            variant = self._greedy_allocate(shuffled, dict(source_available))
+            if variant and variant != baseline:
+                action_sets.append(variant)
+
+        # 3. 单源最优（每个源独立出最好的牌，用于探索）
         by_source = {}
         for a in real_actions:
             by_source.setdefault(a.source_id, []).append(a)
-
-        baseline = []
         for src_id, acts in by_source.items():
-            sufficient = [a for a in acts if a.sufficient]
-            if sufficient:
-                sufficient.sort(key=lambda a: (a.distance, -a.ships))
-                baseline.append(sufficient[0])
-            # 无足够兵力的源不纳入 baseline——solo 必败动作未来价值为负
+            acts.sort(key=lambda a: a._heuristic_score, reverse=True)
+            single = self._greedy_allocate(acts, dict(source_available))
+            if single and single != baseline:
+                action_sets.append(single)
 
-        action_sets = [baseline, []]
+        # 4. 合击变体：无单源能独立攻占时需要多源联合
+        action_sets.extend(self._joint_strike_variants(real_actions, source_available))
 
-        # 单源变体：替换同一源的舰船数
-        for i, base_act in enumerate(baseline):
-            src_id = base_act.source_id
-            variants = by_source.get(src_id, [])
-            for v in variants[:6]:
-                if v.ships != base_act.ships:
-                    variant = list(baseline)
-                    variant[i] = v
-                    action_sets.append(variant)
-
-        # 单源放弃：某个源不出兵
-        if len(baseline) > 1:
-            for i in range(len(baseline)):
-                variant = [a for j, a in enumerate(baseline) if j != i]
-                if variant:
-                    action_sets.append(variant)
-
-        # 合击变体：多源指向同一目标，联合兵力攻占
-        action_sets.extend(self._joint_strike_variants(baseline, by_source))
-
+        # 去重
         seen = set()
         unique = []
         for acts in action_sets:
@@ -176,97 +224,77 @@ class MCTSSearch:
 
         return unique[:50]
 
-    def _joint_strike_variants(self, baseline: list, by_source: dict) -> list:
-        """生成多星合击变体：多个源行星共同打击同一目标。
-
-        仅在无单源能独立攻占时考虑合击。每对源取前 4 舰船规模组合。
-        """
+    def _joint_strike_variants(self, real_actions: list, source_available: dict) -> list:
+        """多星合击变体：对无单源能独立攻占的目标，组合 2 源联合出兵。"""
         variants = []
-        src_to_idx = {act.source_id: i for i, act in enumerate(baseline)}
 
-        # 按目标分组：{target_id: [(source_id, action)]}
         by_target = {}
-        for src_id, acts in by_source.items():
-            for a in acts:
-                by_target.setdefault(a.target_id, []).append((src_id, a))
+        for a in real_actions:
+            by_target.setdefault(a.target_id, []).append(a)
 
-        for target_id, pairs in by_target.items():
-            # 已有单源足够攻占 → 不需要合击
-            if any(a.sufficient for _, a in pairs):
+        for tid, actions in by_target.items():
+            if any(a.sufficient for a in actions):
                 continue
 
-            # 各源对该目标的最优行动
             src_best = {}
-            for src_id, a in pairs:
-                if src_id not in src_best or a.ships > src_best[src_id].ships:
-                    src_best[src_id] = a
+            for a in actions:
+                if a.source_id not in src_best or a.ships > src_best[a.source_id].ships:
+                    src_best[a.source_id] = a
 
-            src_list = list(src_best.items())
-            if len(src_list) < 2:
+            if len(src_best) < 2:
                 continue
 
-            needed = max(a.needed for _, a in src_list)
+            needed = max(a.needed for a in src_best.values())
+            src_list = list(src_best.items())[:4]
 
-            # 尝试每对源，组合舰船规模
-            for si in range(min(len(src_list), 4)):
-                for sj in range(si + 1, min(len(src_list), 4)):
-                    src_a, _ = src_list[si]
-                    src_b, _ = src_list[sj]
+            for si in range(len(src_list)):
+                for sj in range(si + 1, len(src_list)):
+                    src_a_id = src_list[si][0]
+                    src_b_id = src_list[sj][0]
 
-                    src_a_acts = [a for sid, a in pairs if sid == src_a][:4]
-                    src_b_acts = [a for sid, a in pairs if sid == src_b][:4]
+                    acts_a = [a for a in actions if a.source_id == src_a_id][:4]
+                    acts_b = [a for a in actions if a.source_id == src_b_id][:4]
 
-                    for aa in src_a_acts:
-                        for ab in src_b_acts:
+                    for aa in acts_a:
+                        for ab in acts_b:
                             if aa.ships + ab.ships < needed:
                                 continue
-                            variant = list(baseline)
-                            idx_a = src_to_idx.get(src_a)
-                            idx_b = src_to_idx.get(src_b)
-                            if idx_a is not None:
-                                variant[idx_a] = aa
-                            else:
-                                variant.append(aa)
-                            if idx_b is not None:
-                                variant[idx_b] = ab
-                            else:
-                                variant.append(ab)
-                            variants.append(variant)
+                            if aa.ships > source_available.get(src_a_id, 0):
+                                continue
+                            if ab.ships > source_available.get(src_b_id, 0):
+                                continue
+                            variants.append([aa, ab])
 
         return variants[:15]
 
     def _build_action_sets(self, actions: list) -> list:
-        """从动作列表构建动作集合（按行星分组+扰动）。"""
+        """从动作列表构建动作集合（敌方用，同样使用全局贪心分配）。"""
         if not actions:
             return [[]]
 
-        by_source = {}
+        # 可用舰船 = actions 中每源的最大 ship count
+        source_available = {}
         for a in actions:
-            by_source.setdefault(a.source_id, []).append(a)
+            source_available[a.source_id] = max(source_available.get(a.source_id, 0), a.ships)
 
-        baseline = []
-        for src_id, acts in by_source.items():
-            sufficient = [a for a in acts if a.sufficient]
-            if sufficient:
-                sufficient.sort(key=lambda a: (a.distance, -a.ships))
-                baseline.append(sufficient[0])
-            # 无足够兵力的源不纳入 baseline——solo 必败动作未来价值为负
+        for a in actions:
+            a._heuristic_score = 30.0 if a.sufficient else 10.0
+            a._heuristic_score -= a.distance * 0.2
 
-        sets = [baseline, []]
+        sets = [[]]
 
-        for i, base_act in enumerate(baseline):
-            variants = by_source.get(base_act.source_id, [])
-            for v in variants[:4]:
-                if v.ships != base_act.ships:
-                    variant = list(baseline)
-                    variant[i] = v
-                    sets.append(variant)
+        sorted_actions = sorted(actions, key=lambda a: a._heuristic_score, reverse=True)
+        baseline = self._greedy_allocate(sorted_actions, dict(source_available))
+        if baseline:
+            sets.append(baseline)
 
-        if len(baseline) > 1:
-            for i in range(len(baseline)):
-                variant = [a for j, a in enumerate(baseline) if j != i]
-                if variant:
-                    sets.append(variant)
+        for seed in range(6):
+            rng = random.Random(seed * 251 + 17)
+            shuffled = list(actions)
+            rng.shuffle(shuffled)
+            variant = self._greedy_allocate(shuffled, dict(source_available))
+            if variant and variant != baseline:
+                sets.append(variant)
 
         seen = set()
         unique = []
