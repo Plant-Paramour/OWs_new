@@ -38,17 +38,22 @@ Core entry point: `src/search/search.py` → `search_agent_act()`
 ### MCTS 数据流
 ```
 raw obs → parse_observation() → GameState
-         → enumerate_actions() → validate_fleet_arrival() × N → Action[]
+         → enumerate_actions(我方, max_candidates=120) → 物理预计算一次
+         → enumerate_actions(敌方, max_candidates=80)  → 敌方动作池
          → MCTSSearch.search()
-           ├── generate_action_sets() → 我方动作集池 (~50)
-           ├── generate_action_sets(enemy) → 敌方动作集池 (~30)
+           ├── filter_by_dist() → 渐进式动作池 (近距离/中距离/全图)
+           ├── _generate_action_sets_from_pool() × 3 → 我方动作集 (~50)
+           ├── _build_action_sets(enemy_pool) → 固定敌方基线 (4个)
            ├── for each iteration:
-           │     ├── select (我方 max UCB → 敌方 min UCB)
-           │     ├── expand (新敌方回应)
-           │     ├── evaluate: clone → step_state → build_baseline_timelines
-           │     │     └── build_arrival_ledger_accurate → swept-pair ETA
-           │     └── backprop (敌方节点累加值, 我方节点 min over 敌方)
-           └── best: maximin over 我方动作集
+           │     ├── select (我方 max UCB + virtual loss → 敌方 min UCB)
+           │     ├── expand (前4个固定基线 → 后N个自适应回应)
+           │     │     └── _generate_enemy_response(): 覆写 needed →
+           │     │         和我方相同的贪心分配 → 恢复 needed
+           │     ├── evaluate: Timeline.with_actions() → 局部重算受影响行星
+           │     └── backprop (清除 virtual loss, 累加 visits/value)
+           ├── [iter 150] 扩充中距离动作集 → _rebuild_root_children()
+           ├── [iter 350] 扩充全图动作集 → _rebuild_root_children()
+           └── best: maximin over 我方动作集 (vs baseline pass)
 ```
 
 ## Key Constants
@@ -75,44 +80,52 @@ raw obs → parse_observation() → GameState
 
 Monte Carlo Tree Search agent——完整动作集合 UCB1 搜索。每个 MCTS 节点 = 一个完整的本回合动作集合（多行星同时行动），而非逐行星决策。
 
-**已验证：5局全胜 heuristic 对手。**
+**已验证：1局胜 heuristic 对手（改进后）。**
 
 | 文件 | 导出 | 用途 |
 |------|------|------|
 | `state_transition.py` | `clone_state()`, `step_state()` | 严格复制游戏引擎回合推进 |
-| `action_space.py` | `Action` dataclass, `enumerate_actions()` | 动作枚举，船数基于 needed；`validate_fleet_arrival` 过滤无效发射 |
+| `action_space.py` | `Action` dataclass, `enumerate_actions()` | 动作枚举，船数聚焦关键点采样；`validate_fleet_arrival` 过滤无效发射 |
 | `value.py` | `build_baseline_timelines()`, `player_value_from_timelines()` | 时间线投影价值评估（swept-pair 精确 ETA），终局舰船全额计入 |
 | `search.py` | `MCTSNode`, `MCTSSearch` | 二层 minimax 博弈树搜索，~400 次迭代/900ms |
+| `timeline.py` | `Timeline` | 全局面时间线投影，`with_actions()` 局部重算受影响行星 |
 | `agent.py` | `mcts_agent()`, `MCTSOpponent` | 标准 agent 协议入口，try/except 容错 |
 
 **关键设计决策：**
 - **二层博弈树**：Level 0 (root, 我方回合) → 我方动作集 → Level 1 (敌方回合) → 敌方回应 → 时间线评估
 - **Minimax UCB**：我方节点选 max(minimax_value + explore)，敌方节点选 min(avg_value - explore)；最优动作选 maximin
-- **敌方回应建模**：预生成 ~30 敌方动作集，每次模拟随机采样新回应，最多 12 个/my_node，取最坏情况（min）
-- **精确 ETA**：`build_arrival_ledger_accurate()` 使用 swept-pair 前向模拟（与游戏引擎一致），正确计入行星轨道和彗星运动；旧静态射线-圆方法 ETA 偏差 1-2 回合已修复
-- **时间线评估**：`player_value_from_timelines()` 逐回合追踪行星归属 + 在途舰队到达 + 战斗结算（top-2 攻击者对消 → 幸存者 vs 驻军），终局舰船全额计入（直接对应胜负）
-- **无 rollout**：时间线投影已覆盖未来 110 回合在途舰队影响，不需要额外启发式步进（避免噪声 + 提升性能）
-- **船数随机采样**：15 个随机样本覆盖 [0.9×, 3.0×] × needed，探索速度 vs 成本最优权衡
-- **动作集基线**每个行星选最优动作（优先 sufficient + 近距离），始终包含"全 pass"候选
+- **对称自适应敌方回应**（2026-05-31 改进）：敌方使用和我方完全相同的贪心分配算法，但临时覆写目标 `needed` 反映我方发射后的 garrison 减少——敌方自然优先攻击我方削弱的行星。前 4 个回应用固定基线池，后续动态生成
+- **Virtual Loss**（2026-05-31 新增）：选择阶段 `_pending` 虚拟惩罚避免重复选同一条路径，回溯时清除
+- **渐进式动作空间展开（2026-05-31 v2）**：物理计算只跑一次（`enumerate_actions` 全部候选），分距离池生成动作集（≤30 / ≤60 / 全图），合并去重后按启发式评分降序排列。**渐进式加宽**：基于 `root.visits`（非固定迭代数）动态扩充——访问量 < 20 仅 8 个近距离高评分集，逐步放宽距离上限和数量上限，访问量 > 500 时全图展开。每 6 次迭代检查一次是否需要加宽。
+- **前瞻反抢（2026-05-31 v2）**：从基线时间线提取 swing 目标（即将被敌方占领的中立星 + 我方即将失守的行星），在启发式评分中 +50 bonus，生成 swing-first 排序和专用反抢动作集。`enumerate_actions` 改用 `build_arrival_ledger_accurate()`（swept-pair 精确 ETA），确保动作枚举阶段正确投射敌方在途舰队到达事件。
+- **Swing 加权评估（2026-05-31 v2）**：`Timeline.evaluate()` 对易手行星（owner ≠ initial_owner）的产值 ×1.5 加权，强化"剥夺敌方产能"的价值信号。
+- **多维度动作集排序**（2026-05-31 改进）：综合启发式 + 效率优先（每船价值）+ 距离优先 + 优先级优先（非彗星>彗星）+ 随机扰动 + 单源最优 + 合击变体，替代纯随机 shuffle
+- **聚焦舰船采样**（2026-05-31 改进）：`_compute_ship_scales` 聚焦 `[needed, needed×1.2, needed×1.5, needed×2, available]` 关键点，available < needed 时采样合击贡献量；替代全量枚举
+- **动态敌方回应数量**（2026-05-31 v2）：渐进式——访问量 < 20 仅 4 个，20-60 → 5，60-120 → base，120+ → base+4（最多16）
+- **精确 ETA**：`build_arrival_ledger_accurate()` 使用 swept-pair 前向模拟（与游戏引擎一致），正确计入行星轨道和彗星运动
+- **时间线评估**：`player_value_from_timelines()` 逐回合追踪行星归属 + 在途舰队到达 + 战斗结算（top-2 攻击者对消 → 幸存者 vs 驻军），终局舰船全额计入
+- **无 rollout**：时间线投影已覆盖未来 110 回合在途舰队影响，不需要额外启发式步进
 
 **与 `src/search/` 的关键差异：**
-- MCTS 使用 minimax 二层博弈树搜索，建模敌方最优回应（非单一启发式）
-- 时间线投影用 swept-pair 精确 ETA，而非静态射线-圆近似
+- MCTS 使用 minimax 二层博弈树搜索，敌方回应自适应生成（非固定预生成）——对称博弈
+- 时间线投影使用 swept-pair 精确 ETA（`build_arrival_ledger_accurate`），动作枚举和评估统一使用
 - 终局舰船全额估值（1.0），零和从底层自然涌现
 - 评估整局状态而非单次 what-if 结果
+- 渐进式展开早期聚焦近距离战术，后期扩展到全局战略
 
 ## 对战与回放
 
 ```bash
 # MCTS vs heuristic
-python scripts/gen_replays.py --agent mcts --opponent heuristic -n 5
+python scripts/gen_replays.py --agent mcts --opponent heuristic -n 1
 
 # MCTS vs 现有搜索智能体
-python scripts/gen_replays.py --agent mcts --opponent search -n 5
+python scripts/gen_replays.py --agent mcts --opponent search -n 1
 
 # MCTS vs lb1200 / v4_hybrid
-python scripts/gen_replays.py --agent mcts --opponent lb1200 -n 5
-python scripts/gen_replays.py --agent mcts --opponent v4_hybrid -n 5
+python scripts/gen_replays.py --agent mcts --opponent lb1200 -n 1
+python scripts/gen_replays.py --agent mcts --opponent v4_hybrid -n 1
+python scripts/gen_replays.py --agent mcts --opponent h3b1 -n 1
 
 # 查看回放：浏览器打开 replays/viewer.html
 ```

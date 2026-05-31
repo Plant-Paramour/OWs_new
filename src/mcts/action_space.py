@@ -11,7 +11,7 @@ from ..engine.interception import aim_at
 from ..engine.physics import dist
 from ..engine.validation import validate_fleet_arrival
 from ..world.types import GameState
-from ..world.fleet_tracker import build_arrival_ledger
+from ..world.fleet_tracker import build_arrival_ledger_accurate
 from ..world.combat import simulate_planet_timeline, state_at_timeline
 from ..engine.prediction import comet_remaining_life
 
@@ -32,9 +32,18 @@ class Action:
     distance: float
     target_ships: int = 0
     needed: int = 0
+    target_production: int = 0
 
     def is_pass(self) -> bool:
         return self.target_id == -1
+
+    @property
+    def arrival_turn(self) -> int:
+        """舰队到达目标行星的回合数（ceil(eta)）。
+
+        这是"卡牌"视角的核心标识：本回合出牌 → 第 N 回合到达。
+        """
+        return max(1, int(math.ceil(self.eta))) if self.eta > 0 else 0
 
     @property
     def sufficient(self) -> bool:
@@ -68,7 +77,7 @@ def enumerate_actions(state: GameState, player: int,
         Action 列表（含 pass 动作），按距离排序
     """
     actions = []
-    ledger = build_arrival_ledger(state.fleets, state.planets)
+    ledger = build_arrival_ledger_accurate(state)
     horizon = min(state.remaining_steps, 110)
 
     # 为所有行星构建基线时间线投影 —— 用于判断目标在舰队到达时是否已被友军占领
@@ -182,6 +191,7 @@ def enumerate_actions(state: GameState, player: int,
                     distance=d,
                     target_ships=target_ships,
                     needed=needed,
+                    target_production=tgt.production,
                 ))
 
     # ── 彗星撤离: 彗星 life == 1 时显式生成撤离动作 ──
@@ -242,6 +252,7 @@ def enumerate_actions(state: GameState, player: int,
             distance=best_dist,
             target_ships=best_target.ships,
             needed=0,
+            target_production=best_target.production,
         ))
 
     # 按距离排序
@@ -279,35 +290,33 @@ def _compute_needed(target, eta: float, player: int, raw_garrison: int, comets=N
 
 
 def _compute_ship_scales(available: int, target, eta: float, player: int, comets=None, comet_ids=None, needed: int = None) -> list:
-    """舰船规模选项——覆盖合击所需的全范围。
+    """舰船规模选项——聚焦关键数量，过滤无意义小规模。
 
-    舰队越大 → 速度越快 → ETA 越短。选项覆盖：
-      needed  — 刚好够单独攻占
-      all-in  — 全部可用舰船（最快）
-      全整数  — available ≤ 15 时枚举 1..available，供多星合击探索
-      采样点  — available > 15 时在 1..available 间取 10 个代表值
-    时间线评估会正确计入不同舰船数带来的 ETA 差异。
+    舰队越大 → 速度越快 → ETA 越短。选项聚焦：
+      needed       — 刚好够单独攻占（最经济）
+      needed×1.2   — 小安全边际
+      needed×1.5   — 舒适边际
+      needed×2     — 压倒性兵力
+      available    — 全部可用（最快到达）
+      available//3, available//2 — 合击贡献（当单源不够时）
     """
     if needed is None:
         needed = _compute_needed(target, eta, player, target.ships, comets, comet_ids)
     scales = []
 
-    if available <= 15:
-        for s in range(1, available + 1):
-            scales.append(s)
+    if available >= needed:
+        scales.append(needed)
+        scales.append(min(available, int(needed * 1.2)))
+        scales.append(min(available, int(needed * 1.5)))
+        if needed * 2 <= available:
+            scales.append(needed * 2)
     else:
-        # 大舰队：采样覆盖全范围，含 1（最小合击贡献）和 needed、available
-        scales.append(1)
-        if available >= needed:
-            scales.append(needed)
-        step = max(1, available // 8)
-        for s in range(step, available, step):
-            if s not in scales:
-                scales.append(s)
-        if available not in scales:
-            scales.append(available)
+        scales.append(max(1, available // 3))
+        scales.append(max(1, available // 2))
 
-    return sorted(set(scales))
+    scales.append(available)
+
+    return sorted(set(s for s in scales if 1 <= s <= available))
 
 
 def _deduplicate_actions(actions: list) -> list:

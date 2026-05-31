@@ -7,6 +7,7 @@ from .pool import OpponentPool
 from .lb1200 import LB1200Opponent
 from .v4_hybrid import V4HybridOpponent
 from .search_opponent import SearchOpponent
+from .h3b1 import H3b1Opponent
 from ..mcts.agent import MCTSOpponent
 
 
@@ -28,6 +29,7 @@ __all__ = [
     "LB1200Opponent",
     "V4HybridOpponent",
     "SearchOpponent",
+    "H3b1Opponent",
     "MCTSOpponent",
     "get_self_play",
 ]

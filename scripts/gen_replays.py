@@ -10,7 +10,8 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_bufferin
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.opponents import (SniperOpponent, HeuristicOpponent, LB1200Opponent,
-                            V4HybridOpponent, SearchOpponent, MCTSOpponent)
+                            V4HybridOpponent, SearchOpponent, MCTSOpponent,
+                            H3b1Opponent)
 from src.world.observation import parse_observation
 
 
@@ -270,6 +271,8 @@ def _build_opponent(opponent_str: str):
         return SearchOpponent()
     elif opponent_str == "mcts":
         return MCTSOpponent()
+    elif opponent_str == "h3b1":
+        return H3b1Opponent()
     else:
         print(f"未知对手类型 '{opponent_str}'，回退到 random")
         return "random"
