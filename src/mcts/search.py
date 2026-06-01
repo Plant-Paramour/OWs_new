@@ -246,23 +246,25 @@ class MCTSSearch:
         return result
 
     def _quick_action_score(self, action, comet_ids, swing_targets=None):
-        """快速启发式评分，用于全局贪心排序。
+        """动作评分 —— 直接从价值公式推导。
 
-        swing_targets: 即将被敌方占领的行星集合——反抢机会价值极高。
+        value = production × (horizon − eta) − cost
+        核心项是产能 × 预期持有回合，无魔数权重。
         """
-        score = 20.0
-        if action.sufficient:
-            score += 30.0
-        if action.target_id not in comet_ids:
-            score += 10.0
-        score -= action.distance * 0.2
-        # 产能加权：高产能行星长期价值远超低产能星（prod=10 × 100回合 = 1000+ 资源）
-        score += action.target_production * 5.0
+        horizon = self.root_timeline.horizon if self.root_timeline else 100
+
+        hold_estimate = max(1.0, horizon - action.eta)
+        score = action.target_production * hold_estimate
+
+        if action.target_id in comet_ids:
+            score *= 0.05
+
         if action.needed > 0 and action.ships > 0:
-            score += (action.needed / action.ships) * 15.0
-        # 反抢 bonus：敌方投入舰船攻占 → 我方轻取 → 净 swing 极大
+            score += (action.needed / action.ships) * 20.0
+
         if swing_targets and action.target_id in swing_targets:
-            score += 50.0
+            score += action.target_production * hold_estimate * 0.3
+
         return score
 
     def _generate_action_sets_from_pool(self, real_actions: list, state: GameState, swing_targets: set = None) -> list:
@@ -419,10 +421,12 @@ class MCTSSearch:
         for a in actions:
             source_available[a.source_id] = max(source_available.get(a.source_id, 0), a.ships)
 
+        horizon = self.root_timeline.horizon if self.root_timeline else 100
         for a in actions:
-            a._heuristic_score = 30.0 if a.sufficient else 10.0
-            a._heuristic_score -= a.distance * 0.2
-            a._heuristic_score += a.target_production * 5.0
+            hold_estimate = max(1.0, horizon - a.eta)
+            a._heuristic_score = a.target_production * hold_estimate
+            if a.sufficient:
+                a._heuristic_score += 20.0
 
         sets = [[]]
 
